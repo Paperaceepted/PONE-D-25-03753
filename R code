@@ -1,0 +1,968 @@
+# ================================================================================
+# CHARLS Longitudinal Analysis: TyG Index and Chronic Disease Risk Assessment
+# ================================================================================
+# This script performs comprehensive survival analysis using CHARLS data to assess
+# the association between TyG index and chronic disease incidence
+# ================================================================================
+
+# Load required libraries
+pacman::p_load(
+  dplyr, tibble, data.table, VIM, mice, ggplot2, gtsummary, 
+  corrplot, survival, rms, ggpubr, ggsci, riskRegression, 
+  patchwork, sf, tableone, flextable, officer, RColorBrewer,
+  survminer, gridExtra, pROC, tidyr, openxlsx
+)
+
+# Set global options
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+# ================================================================================
+# 1. DATA PREPROCESSING AND CLEANING
+# ================================================================================
+
+preprocess_charls_data <- function(file_path) {
+  # Read and initial processing
+  data <- read.csv(file_path, header = TRUE, row.names = 1)
+  
+  # Filter complete cases for interview date
+  data <- data[complete.cases(data[, c("iwy", "iwm")]), ]
+  
+  # Select relevant variables
+  selected_vars <- c(
+    "ID", "wave", "age", "gender", "rural", "edu", "marry", "smokev", "drinkev",
+    "mheight", "mweight", "mwaist", "bmi",
+    "hibpe", "diabe", "cancre", "lunge", "dyslipe", "hearte", "stroke", 
+    "psyche", "arthre", "livere", "kidneye", "digeste", "asthmae", "memrye",
+    "bl_wbc", "bl_mcv", "bl_plt", "bl_bun", "bl_glu", "bl_crea", "bl_cho", 
+    "bl_tg", "bl_hdl", "bl_ldl", "bl_crp", "bl_hbalc", "bl_ua", "bl_hct", 
+    "bl_hgb", "bl_cysc", "totmet", "tyg", "tyg_bmi", "hibpe_1", "diabe_1", 
+    "systo", "diasto", "cesd10"
+  )
+  
+  data <- data %>% select(all_of(selected_vars))
+  
+  # Process longitudinal data - select most recent non-missing values
+  setDT(data)
+  setorder(data, ID, -wave)
+  data_merged <- data[, lapply(.SD, function(x) x[!is.na(x)][1]), by = ID]
+  
+  # Convert to final format
+  data_final <- data_merged %>%
+    tibble::column_to_rownames("ID") %>%
+    select(-wave) %>%
+    filter(!is.na(tyg) & !is.na(tyg_bmi))
+  
+  return(data_final)
+}
+
+clean_missing_data <- function(data, var_threshold = 0.05, sample_threshold = 0.05) {
+  # Remove variables with >5% missing values
+  data_cleaned <- data %>% 
+    select(where(function(x) mean(is.na(x)) <= var_threshold))
+  
+  # Remove samples with >5% missing values
+  data_cleaned <- data_cleaned %>% 
+    filter(rowMeans(is.na(.)) <= sample_threshold)
+  
+  return(data_cleaned)
+}
+
+detect_outliers_3sigma <- function(data) {
+  # Identify continuous variables
+  continuous_vars <- sapply(data, function(x) {
+    is.numeric(x) && length(unique(x)) > 10
+  })
+  
+  # Detect outliers using 3-sigma rule
+  outlier_detection <- function(x) {
+    mean_x <- mean(x, na.rm = TRUE)
+    sd_x <- sd(x, na.rm = TRUE)
+    return(x < (mean_x - 3 * sd_x) | x > (mean_x + 3 * sd_x))
+  }
+  
+  outlier_matrix <- sapply(data[, continuous_vars], outlier_detection)
+  rows_with_outliers <- apply(outlier_matrix, 1, any)
+  
+  return(data[!rows_with_outliers, ])
+}
+
+# ================================================================================
+# 2. MULTIPLE IMPUTATION
+# ================================================================================
+
+perform_multiple_imputation <- function(data, m = 5, maxit = 50) {
+  # Initialize imputation
+  init <- mice(data, maxit = 0, printFlag = FALSE)
+  predM <- init$predictorMatrix
+  
+  # Identify variable types
+  vars_with_missing <- colnames(data)[colSums(is.na(data)) > 0]
+  
+  binary_vars <- character()
+  continuous_vars <- character()
+  
+  for (var in vars_with_missing) {
+    num_unique <- length(unique(data[[var]]))
+    if (num_unique == 2) {
+      binary_vars <- c(binary_vars, var)
+    } else {
+      continuous_vars <- c(continuous_vars, var)
+    }
+  }
+  
+  # Set imputation methods
+  meth <- init$method
+  meth[binary_vars] <- "logreg"
+  meth[continuous_vars] <- "pmm"
+  
+  # Perform multiple imputation
+  imputed_data <- mice(data, method = meth, predictorMatrix = predM, 
+                       m = m, maxit = maxit, printFlag = FALSE)
+  
+  return(complete(imputed_data))
+}
+
+# ================================================================================
+# 3. FEATURE ENGINEERING
+# ================================================================================
+
+calculate_derived_metrics <- function(data) {
+  data %>%
+    mutate(
+      WC = mwaist,
+      WHtR = mwaist / (mheight * 100),
+      TyG_WC = tyg * WC,
+      TyG_WHtR = tyg * WHtR,
+      tyg_group = case_when(
+        tyg < 8.36 ~ "Group 1",
+        tyg >= 8.36 & tyg < 8.87 ~ "Group 2",
+        TRUE ~ "Group 3"
+      )
+    )
+}
+
+# ================================================================================
+# 4. SURVIVAL TIME CALCULATION
+# ================================================================================
+
+calculate_survival_times <- function(raw_data, processed_data) {
+  disease_list <- c("hibpe", "diabe", "hearte", "stroke", "dyslipe", "digeste")
+  
+  # Extract matching samples
+  subset_data <- raw_data[raw_data$ID %in% rownames(processed_data), ]
+  
+  # Calculate disease onset times
+  for (disease in disease_list) {
+    time_col <- paste0(disease, "_time")
+    subset_data[[time_col]] <- NA
+    
+    for (id in unique(subset_data$ID)) {
+      person_data <- subset_data[subset_data$ID == id, ]
+      
+      if (!is.na(person_data[1, disease]) && person_data[1, disease] == 1) {
+        person_data[[time_col]] <- 0
+      } else {
+        disease_onset <- which(person_data[[disease]] == 1)
+        if (length(disease_onset) == 0) {
+          disease_onset <- nrow(person_data)
+        } else {
+          disease_onset <- disease_onset[1]
+        }
+        
+        years_diff <- person_data$iwy[disease_onset] - person_data$iwy[1]
+        months_diff <- person_data$iwm[disease_onset] - person_data$iwm[1]
+        person_data[[time_col]] <- years_diff + months_diff / 12
+      }
+      
+      subset_data[subset_data$ID == id, time_col] <- person_data[[time_col]]
+    }
+  }
+  
+  # Merge time variables
+  disease_time_cols <- grep("_time$", colnames(subset_data), value = TRUE)
+  temp_data <- subset_data[, c("ID", disease_time_cols)]
+  temp_data <- temp_data[!duplicated(temp_data$ID), ]
+  
+  processed_data[, disease_time_cols] <- temp_data[match(rownames(processed_data), temp_data$ID), disease_time_cols]
+  
+  return(processed_data)
+}
+
+# ================================================================================
+# 5. BASELINE CHARACTERISTICS TABLE
+# ================================================================================
+
+create_baseline_table <- function(data, stratify_var = "tyg_group") {
+  # Prepare categorical variables
+  binary_vars <- c("gender", "smokev", "drinkev", "hibpe", "diabe", "cancre", 
+                   "lunge", "dyslipe", "hearte", "stroke", "psyche", "arthre", "memrye")
+  
+  for (var in binary_vars) {
+    if (var %in% names(data)) {
+      data[[var]] <- factor(data[[var]], levels = c(0, 1), labels = c("No", "Yes"))
+    }
+  }
+  
+  # Detect variable types
+  var_types <- lapply(data, function(x) {
+    if (is.numeric(x) && length(unique(x)) > 10) "continuous" else "categorical"
+  })
+  
+  # Create summary table
+  baseline_table <- tbl_summary(
+    data = data,
+    by = all_of(stratify_var),
+    type = var_types,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)",
+      all_continuous() ~ "{mean} ({sd})"
+    ),
+    digits = list(
+      all_categorical() ~ c(0, 1),
+      all_continuous() ~ c(2, 2)
+    ),
+    missing = "no"
+  )
+  
+  return(baseline_table)
+}
+
+# ================================================================================
+# 6. CORRELATION ANALYSIS
+# ================================================================================
+
+analyze_correlations <- function(data, diseases) {
+  # Convert to numeric for correlation
+  cor_data <- sapply(data[diseases], as.numeric) - 1
+  cor_matrix <- cor(cor_data)
+  
+  # Calculate p-values
+  p_matrix <- sapply(data[diseases], function(x) {
+    sapply(data[diseases], function(y) {
+      cor.test(as.numeric(x) - 1, as.numeric(y) - 1, method = "pearson")$p.value
+    })
+  })
+  
+  return(list(correlation = cor_matrix, p_values = p_matrix))
+}
+
+plot_correlation_matrix <- function(cor_result, output_file) {
+  col <- colorRampPalette(c("#5E4FA2", "#66C2A5", "#E6F598", "#FEE08B", "#F46D43", "#9E0142"))
+  
+  pdf(output_file, width = 10, height = 10)
+  corrplot(cor_result$correlation, method = "circle", col = col(100), 
+           tl.col = "black", tl.cex = 1, tl.srt = 45, tl.pos = "lt",
+           p.mat = cor_result$p_values, type = "lower", cl.pos = "r",
+           sig.level = c(0.001, 0.01, 0.05), pch.cex = 1.2,
+           insig = "label_sig", pch.col = "gray20", addgrid.col = "black")
+  
+  corrplot(cor_result$correlation, method = "number", type = "upper", 
+           col = col(100), diag = TRUE, tl.col = "n", tl.pos = "n", 
+           add = TRUE, addgrid.col = "black")
+  dev.off()
+}
+
+# ================================================================================
+# 7. RESTRICTED CUBIC SPLINES ANALYSIS
+# ================================================================================
+
+perform_rcs_analysis <- function(data, pred_vars, diseases) {
+  dd <- datadist(data)
+  options(datadist = "dd")
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      tryCatch({
+        # Fit RCS model
+        rcs_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ rcs(", pred_var, ", 3)"))
+        rcs_fit <- cph(rcs_formula, data = data, surv = TRUE, x = TRUE, y = TRUE)
+        
+        # Generate predictions
+        pred <- Predict(rcs_fit, name = pred_var, 
+                       ref.zero = median(data[[pred_var]], na.rm = TRUE), fun = exp)
+        pred_df <- as.data.frame(pred)
+        
+        # Create plot
+        p <- ggplot(pred_df, aes_string(x = pred_var, y = "yhat")) +
+          geom_line(color = "red", size = 1) +
+          geom_ribbon(aes_string(ymin = "lower", ymax = "upper"), alpha = 0.2) +
+          geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+          labs(
+            x = pred_var,
+            y = "Hazard Ratio",
+            title = paste0("Dose-Response: ", pred_var, " vs ", disease)
+          ) +
+          theme_classic() +
+          theme(plot.title = element_text(hjust = 0.5))
+        
+        ggsave(paste0("rcs_", pred_var, "_", disease, ".pdf"), plot = p, width = 8, height = 6)
+        
+      }, error = function(e) {
+        message("RCS analysis failed for ", pred_var, " and ", disease)
+      })
+    }
+  }
+}
+
+# ================================================================================
+# 8. COX PROPORTIONAL HAZARDS MODELS
+# ================================================================================
+
+fit_cox_models <- function(data, pred_vars, diseases) {
+  results <- data.frame()
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      # Model 1: Age and gender adjusted
+      cox_formula1 <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ factor(tyg_group) + ", 
+                                       pred_var, " + age + gender"))
+      
+      # Model 2: Fully adjusted
+      cox_formula2 <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ factor(tyg_group) + ", 
+                                       pred_var, " + age + gender + marry + rural + edu + smokev + drinkev"))
+      
+      for (model_num in 1:2) {
+        cox_formula <- if (model_num == 1) cox_formula1 else cox_formula2
+        
+        tryCatch({
+          cox_fit <- coxph(cox_formula, data = data)
+          summary_cox <- summary(cox_fit)
+          coef_table <- summary_cox$coefficients
+          conf_int <- exp(confint(cox_fit))
+          
+          # Extract results for TyG groups
+          group_coef <- rownames(coef_table)[grepl("factor\\(tyg_group\\)", rownames(coef_table))]
+          
+          for (coef_row in group_coef) {
+            HR <- coef_table[coef_row, "exp(coef)"]
+            lower_ci <- conf_int[coef_row, "2.5 %"]
+            upper_ci <- conf_int[coef_row, "97.5 %"]
+            p_value <- coef_table[coef_row, "Pr(>|z|)"]
+            group <- gsub("factor\\(tyg_group\\)", "", coef_row)
+            
+            results <- rbind(results, data.frame(
+              Predictor = pred_var,
+              Disease = disease,
+              Model = model_num,
+              Group = group,
+              HR = HR,
+              Lower_CI = lower_ci,
+              Upper_CI = upper_ci,
+              P_value = p_value
+            ))
+          }
+          
+        }, error = function(e) {
+          message("Cox model failed for ", pred_var, " and ", disease, " model ", model_num)
+        })
+      }
+    }
+  }
+  
+  return(results)
+}
+
+# ================================================================================
+# 9. MODEL DISCRIMINATION AND CALIBRATION
+# ================================================================================
+
+assess_model_performance <- function(data, pred_vars, diseases) {
+  performance_results <- data.frame()
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      tryCatch({
+        cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ ", 
+                                        pred_var, " + age + gender + rural + edu + marry + smokev + drinkev"))
+        
+        cox_fit <- coxph(cox_formula, data = data)
+        
+        # Calculate C-index
+        c_index <- concordance(cox_fit)$concordance
+        n <- sum(!is.na(data[[disease]]) & !is.na(data[[time_var]]))
+        se <- sqrt((c_index * (1 - c_index)) / n)
+        c_index_lower <- max(0.5, c_index - 1.96 * se)
+        c_index_upper <- min(1.0, c_index + 1.96 * se)
+        
+        performance_results <- rbind(performance_results, data.frame(
+          Predictor = pred_var,
+          Disease = disease,
+          C_Index = c_index,
+          C_Index_Lower = c_index_lower,
+          C_Index_Upper = c_index_upper
+        ))
+        
+      }, error = function(e) {
+        message("Performance assessment failed for ", pred_var, " and ", disease)
+      })
+    }
+  }
+  
+  return(performance_results)
+}
+
+# ================================================================================
+# 10. TIME-DEPENDENT AUC ANALYSIS
+# ================================================================================
+
+perform_time_dependent_auc <- function(data, pred_vars, diseases, time_points = 1:8) {
+  for (disease in diseases) {
+    time_var <- paste0(disease, "_time")
+    cox_models <- list()
+    
+    # Fit Cox models for each predictor
+    for (pred_var in pred_vars) {
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ ", 
+                                      pred_var, " + age + gender + rural + edu + marry + smokev + drinkev"))
+      
+      tryCatch({
+        cox_model <- coxph(cox_formula, data = data, x = TRUE)
+        cox_models[[pred_var]] <- cox_model
+      }, error = function(e) {
+        message("Time-dependent AUC model failed for ", pred_var, " and ", disease)
+      })
+    }
+    
+    if (length(cox_models) == 0) next
+    
+    # Calculate time-dependent AUC
+    tryCatch({
+      auc_result <- Score(cox_models, 
+                         formula = as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ 1")), 
+                         data = data, null.model = FALSE, times = time_points, metrics = "auc")
+      
+      auc_data <- na.omit(plotAUC(auc_result))
+      auc_data$times <- as.factor(auc_data$times)
+      
+      # Create time-series plot
+      p <- ggplot(auc_data, aes(x = times, y = AUC, group = model, color = model)) +
+        geom_line(size = 1) +
+        geom_point(size = 2) +
+        geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+        theme_classic() +
+        labs(x = "Follow-up time (years)", y = "AUC", 
+             title = paste("Time-dependent AUC for", disease)) +
+        scale_color_brewer(palette = "Spectral") +
+        theme(plot.title = element_text(hjust = 0.5))
+      
+      ggsave(paste0("time_auc_", disease, ".pdf"), p, width = 12, height = 6, dpi = 300)
+      
+    }, error = function(e) {
+      message("Time-dependent AUC calculation failed for ", disease)
+    })
+  }
+}
+
+# ================================================================================
+# 11. SENSITIVITY ANALYSES
+# ================================================================================
+
+perform_sensitivity_analysis <- function(data, pred_vars, diseases) {
+  # Identify high-risk population at baseline
+  identify_high_risk <- function(data) {
+    high_risk <- (
+      (data$bl_glu >= 100 & data$bl_glu < 126) |
+      (data$systo >= 120 & data$systo < 140) |
+      (data$bl_cho >= 5.2 & data$bl_cho < 6.2) |
+      (data$bl_tg >= 1.7 & data$bl_tg < 2.3)
+    )
+    return(high_risk)
+  }
+  
+  data$high_risk_status <- identify_high_risk(data)
+  low_risk_data <- data %>% filter(!high_risk_status | is.na(high_risk_status))
+  
+  sensitivity_results <- data.frame()
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ ", 
+                                      pred_var, " + age + gender + rural + edu + marry + smokev + drinkev"))
+      
+      tryCatch({
+        # Full population model
+        full_model <- coxph(cox_formula, data = data)
+        full_hr <- exp(coef(full_model)[pred_var])
+        
+        # Low-risk population model
+        low_risk_model <- coxph(cox_formula, data = low_risk_data)
+        low_risk_hr <- exp(coef(low_risk_model)[pred_var])
+        
+        # Calculate HR change
+        hr_change_percent <- ((low_risk_hr - full_hr) / full_hr) * 100
+        
+        sensitivity_results <- rbind(sensitivity_results, data.frame(
+          Predictor = pred_var,
+          Disease = disease,
+          Full_Population_HR = full_hr,
+          Low_Risk_HR = low_risk_hr,
+          HR_Change_Percent = hr_change_percent
+        ))
+        
+      }, error = function(e) {
+        message("Sensitivity analysis failed for ", pred_var, " and ", disease)
+      })
+    }
+  }
+  
+  return(sensitivity_results)
+}
+
+# ================================================================================
+# 12. PROPORTIONAL HAZARDS ASSUMPTION TESTING
+# ================================================================================
+
+test_proportional_hazards <- function(data, pred_vars, diseases) {
+  ph_results <- data.frame()
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ ", 
+                                      pred_var, " + age + gender + rural + edu + marry + smokev + drinkev"))
+      
+      tryCatch({
+        cox_fit <- coxph(cox_formula, data = data)
+        ph_test <- cox.zph(cox_fit)
+        
+        pred_test <- ph_test$table[pred_var, ]
+        ph_met <- ifelse(pred_test["p"] > 0.05, "Yes", "No")
+        
+        ph_results <- rbind(ph_results, data.frame(
+          Predictor = pred_var,
+          Disease = disease,
+          Test_Statistic = round(pred_test["chisq"], 3),
+          P_Value = round(pred_test["p"], 4),
+          PH_Assumption_Met = ph_met
+        ))
+        
+      }, error = function(e) {
+        message("PH assumption test failed for ", pred_var, " and ", disease)
+      })
+    }
+  }
+  
+  return(ph_results)
+}
+
+# ================================================================================
+# 13. MAIN ANALYSIS PIPELINE
+# ================================================================================
+
+run_main_analysis <- function(data_file, raw_data_file) {
+  # Step 1: Data preprocessing
+  message("Step 1: Data preprocessing...")
+  data <- preprocess_charls_data(data_file)
+  data_cleaned <- clean_missing_data(data)
+  data_no_outliers <- detect_outliers_3sigma(data_cleaned)
+  
+  # Step 2: Multiple imputation
+  message("Step 2: Multiple imputation...")
+  data_imputed <- perform_multiple_imputation(data_no_outliers)
+  
+  # Step 3: Feature engineering
+  message("Step 3: Feature engineering...")
+  data_final <- calculate_derived_metrics(data_imputed)
+  
+  # Step 4: Calculate survival times
+  message("Step 4: Calculating survival times...")
+  raw_data <- read.csv(raw_data_file, header = TRUE, row.names = 1)
+  data_with_times <- calculate_survival_times(raw_data, data_final)
+  
+  # Define analysis variables
+  pred_vars <- c("tyg", "tyg_bmi", "WC", "TyG_WC", "WHtR", "TyG_WHtR", "bmi")
+  diseases <- c("hibpe", "diabe", "hearte", "stroke", "dyslipe", "digeste")
+  
+  # Step 5: Baseline characteristics
+  message("Step 5: Creating baseline table...")
+  baseline_table <- create_baseline_table(data_with_times)
+  
+  # Step 6: Correlation analysis
+  message("Step 6: Correlation analysis...")
+  all_vars <- c(diseases, pred_vars)
+  cor_result <- analyze_correlations(data_with_times, all_vars)
+  plot_correlation_matrix(cor_result, "correlation_matrix.pdf")
+  
+  # Step 7: Restricted cubic splines
+  message("Step 7: RCS analysis...")
+  perform_rcs_analysis(data_with_times, pred_vars, diseases)
+  
+  # Step 8: Cox proportional hazards models
+  message("Step 8: Cox regression analysis...")
+  cox_results <- fit_cox_models(data_with_times, pred_vars, diseases)
+  
+  # Step 9: Model performance assessment
+  message("Step 9: Model performance assessment...")
+  performance_results <- assess_model_performance(data_with_times, pred_vars, diseases)
+  
+  # Step 10: Time-dependent AUC
+  message("Step 10: Time-dependent AUC analysis...")
+  perform_time_dependent_auc(data_with_times, pred_vars, diseases)
+  
+  # Step 11: Sensitivity analysis
+  message("Step 11: Sensitivity analysis...")
+  sensitivity_results <- perform_sensitivity_analysis(data_with_times, pred_vars, diseases)
+  
+  # Step 12: Proportional hazards assumption testing
+  message("Step 12: Testing proportional hazards assumptions...")
+  ph_results <- test_proportional_hazards(data_with_times, pred_vars, diseases)
+  
+  # Save all results
+  results_list <- list(
+    baseline_table = baseline_table,
+    cox_results = cox_results,
+    performance_results = performance_results,
+    sensitivity_results = sensitivity_results,
+    ph_results = ph_results
+  )
+  
+  # Export results
+  write.csv(cox_results, "cox_regression_results.csv", row.names = FALSE)
+  write.csv(performance_results, "model_performance.csv", row.names = FALSE)
+  write.csv(sensitivity_results, "sensitivity_analysis.csv", row.names = FALSE)
+  write.csv(ph_results, "proportional_hazards_tests.csv", row.names = FALSE)
+  
+  message("Analysis completed successfully!")
+  return(results_list)
+}
+
+# ================================================================================
+# 14. ADDITIONAL UTILITY FUNCTIONS
+# ================================================================================
+
+create_forest_plot <- function(cox_results, disease_name) {
+  # Filter results for specific disease
+  plot_data <- cox_results %>%
+    filter(Disease == disease_name, Model == 2) %>%
+    mutate(
+      CI = paste0(round(HR, 2), " (", round(Lower_CI, 2), "-", round(Upper_CI, 2), ")"),
+      Significant = ifelse(P_value < 0.05, "Yes", "No")
+    )
+  
+  # Create forest plot
+  p <- ggplot(plot_data, aes(x = HR, y = reorder(Predictor, HR))) +
+    geom_point(aes(color = Significant), size = 3) +
+    geom_errorbarh(aes(xmin = Lower_CI, xmax = Upper_CI, color = Significant), height = 0.2) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+    scale_color_manual(values = c("No" = "gray", "Yes" = "red")) +
+    labs(
+      title = paste("Forest Plot:", disease_name),
+      x = "Hazard Ratio (95% CI)",
+      y = "Predictor Variables"
+    ) +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  return(p)
+}
+
+generate_summary_report <- function(results_list) {
+  # Extract key findings
+  cox_results <- results_list$cox_results
+  performance_results <- results_list$performance_results
+  
+  # Best predictors by C-index
+  best_predictors <- performance_results %>%
+    group_by(Disease) %>%
+    slice_max(C_Index, n = 1) %>%
+    select(Disease, Predictor, C_Index)
+  
+  # Significant associations (p < 0.05)
+  significant_results <- cox_results %>%
+    filter(P_value < 0.05, Model == 2) %>%
+    group_by(Disease) %>%
+    summarise(
+      n_significant = n(),
+      predictors = paste(unique(Predictor), collapse = ", "),
+      .groups = "drop"
+    )
+  
+  # Generate summary report
+  summary_report <- list(
+    total_models = nrow(performance_results),
+    mean_c_index = round(mean(performance_results$C_Index, na.rm = TRUE), 3),
+    best_predictors = best_predictors,
+    significant_associations = significant_results
+  )
+  
+  return(summary_report)
+}
+
+create_kaplan_meier_plots <- function(data, diseases) {
+  for (disease in diseases) {
+    time_var <- paste0(disease, "_time")
+    
+    if (!all(c("tyg_group", disease, time_var) %in% names(data))) next
+    
+    tryCatch({
+      # Create survival object
+      surv_obj <- Surv(data[[time_var]], data[[disease]])
+      fit <- survfit(surv_obj ~ tyg_group, data = data)
+      
+      # Create Kaplan-Meier plot
+      p <- ggsurvplot(
+        fit,
+        data = data,
+        pval = TRUE,
+        conf.int = TRUE,
+        risk.table = TRUE,
+        risk.table.col = "strata",
+        linetype = "strata",
+        surv.median.line = "hv",
+        ggtheme = theme_bw(),
+        palette = c("#E7B800", "#2E9FDF", "#FC4E07"),
+        title = paste("Kaplan-Meier Survival Curves:", disease),
+        xlab = "Time (years)",
+        ylab = "Survival Probability"
+      )
+      
+      # Save plot
+      ggsave(paste0("km_plot_", disease, ".pdf"), 
+             plot = print(p), width = 10, height = 8)
+      
+    }, error = function(e) {
+      message("Kaplan-Meier plot failed for ", disease)
+    })
+  }
+}
+
+perform_subgroup_analysis <- function(data, pred_vars, diseases) {
+  subgroup_results <- data.frame()
+  
+  # Define subgroups
+  subgroups <- list(
+    age_young = data$age < median(data$age, na.rm = TRUE),
+    age_old = data$age >= median(data$age, na.rm = TRUE),
+    male = data$gender == 1,
+    female = data$gender == 0,
+    urban = data$rural == 0,
+    rural = data$rural == 1
+  )
+  
+  for (subgroup_name in names(subgroups)) {
+    subgroup_data <- data[subgroups[[subgroup_name]], ]
+    
+    for (pred_var in pred_vars) {
+      for (disease in diseases) {
+        time_var <- paste0(disease, "_time")
+        
+        if (!all(c(pred_var, disease, time_var) %in% names(subgroup_data))) next
+        if (nrow(subgroup_data) < 50) next  # Minimum sample size
+        
+        cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ ", 
+                                        pred_var, " + age + gender"))
+        
+        tryCatch({
+          cox_fit <- coxph(cox_formula, data = subgroup_data)
+          hr <- exp(coef(cox_fit)[pred_var])
+          ci <- exp(confint(cox_fit)[pred_var, ])
+          p_val <- summary(cox_fit)$coefficients[pred_var, "Pr(>|z|)"]
+          
+          subgroup_results <- rbind(subgroup_results, data.frame(
+            Subgroup = subgroup_name,
+            Predictor = pred_var,
+            Disease = disease,
+            HR = hr,
+            Lower_CI = ci[1],
+            Upper_CI = ci[2],
+            P_value = p_val,
+            N = nrow(subgroup_data)
+          ))
+          
+        }, error = function(e) {
+          message("Subgroup analysis failed for ", subgroup_name, ", ", pred_var, ", ", disease)
+        })
+      }
+    }
+  }
+  
+  return(subgroup_results)
+}
+
+calculate_population_attributable_risk <- function(data, pred_vars, diseases) {
+  par_results <- data.frame()
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      # Categorize predictor into tertiles
+      data$pred_tertile <- cut(data[[pred_var]], 
+                              breaks = quantile(data[[pred_var]], c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                              labels = c("Low", "Medium", "High"), include.lowest = TRUE)
+      
+      tryCatch({
+        cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ pred_tertile + age + gender"))
+        cox_fit <- coxph(cox_formula, data = data)
+        
+        # Calculate HR for high vs low
+        hr_high <- exp(coef(cox_fit)["pred_tertileHigh"])
+        
+        # Calculate prevalence of high exposure
+        prev_high <- mean(data$pred_tertile == "High", na.rm = TRUE)
+        
+        # Calculate PAR
+        par <- (prev_high * (hr_high - 1)) / (1 + prev_high * (hr_high - 1))
+        
+        par_results <- rbind(par_results, data.frame(
+          Predictor = pred_var,
+          Disease = disease,
+          HR_High_vs_Low = hr_high,
+          Prevalence_High = prev_high,
+          PAR = par
+        ))
+        
+      }, error = function(e) {
+        message("PAR calculation failed for ", pred_var, " and ", disease)
+      })
+    }
+  }
+  
+  return(par_results)
+}
+
+validate_model_assumptions <- function(data, pred_vars, diseases) {
+  validation_results <- data.frame()
+  
+  for (pred_var in pred_vars) {
+    for (disease in diseases) {
+      time_var <- paste0(disease, "_time")
+      
+      if (!all(c(pred_var, disease, time_var) %in% names(data))) next
+      
+      cox_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ ", 
+                                      pred_var, " + age + gender"))
+      
+      tryCatch({
+        cox_fit <- coxph(cox_formula, data = data)
+        
+        # Test proportional hazards assumption
+        ph_test <- cox.zph(cox_fit)
+        ph_p <- ph_test$table[pred_var, "p"]
+        
+        # Test linearity assumption for continuous variables
+        if (is.numeric(data[[pred_var]])) {
+          # Fit model with spline term
+          spline_formula <- as.formula(paste0("Surv(", time_var, ", ", disease, ") ~ pspline(", 
+                                             pred_var, ") + age + gender"))
+          spline_fit <- coxph(spline_formula, data = data)
+          
+          # Test linearity
+          linearity_test <- anova(cox_fit, spline_fit)
+          linearity_p <- linearity_test[2, "P(>|Chi|)"]
+        } else {
+          linearity_p <- NA
+        }
+        
+        validation_results <- rbind(validation_results, data.frame(
+          Predictor = pred_var,
+          Disease = disease,
+          PH_Test_P = ph_p,
+          PH_Assumption_Met = ifelse(ph_p > 0.05, "Yes", "No"),
+          Linearity_Test_P = linearity_p,
+          Linearity_Assumption_Met = ifelse(is.na(linearity_p) || linearity_p > 0.05, "Yes", "No")
+        ))
+        
+      }, error = function(e) {
+        message("Assumption validation failed for ", pred_var, " and ", disease)
+      })
+    }
+  }
+  
+  return(validation_results)
+}
+
+create_publication_table <- function(cox_results, output_file) {
+  # Format results for publication
+  pub_table <- cox_results %>%
+    filter(Model == 2) %>%  # Use fully adjusted model
+    mutate(
+      HR_CI = paste0(sprintf("%.2f", HR), " (", 
+                     sprintf("%.2f", Lower_CI), "-", 
+                     sprintf("%.2f", Upper_CI), ")"),
+      P_formatted = case_when(
+        P_value < 0.001 ~ "<0.001",
+        P_value < 0.01 ~ sprintf("%.3f", P_value),
+        TRUE ~ sprintf("%.2f", P_value)
+      )
+    ) %>%
+    select(Predictor, Disease, Group, HR_CI, P_formatted) %>%
+    pivot_wider(names_from = Group, values_from = c(HR_CI, P_formatted)) %>%
+    arrange(Disease, Predictor)
+  
+  # Create flextable
+  ft <- flextable(pub_table) %>%
+    theme_booktabs() %>%
+    autofit() %>%
+    align(align = "center", part = "all") %>%
+    align(j = 1:2, align = "left", part = "all")
+  
+  # Save table
+  save_as_docx(ft, path = output_file)
+  
+  return(ft)
+}
+
+# ================================================================================
+# 15. EXECUTION WRAPPER
+# ================================================================================
+
+# Main execution function
+main <- function() {
+  # Set working directory and file paths
+  data_file <- "processed_data.csv"
+  raw_data_file <- "raw_charls_data.csv"
+  
+  # Run complete analysis
+  tryCatch({
+    results <- run_main_analysis(data_file, raw_data_file)
+    
+    # Generate additional analyses
+    message("Generating additional analyses...")
+    
+    # Create summary report
+    summary_report <- generate_summary_report(results)
+    print(summary_report)
+    
+    # Save comprehensive results
+    saveRDS(results, "complete_analysis_results.rds")
+    
+    message("All analyses completed successfully!")
+    message("Results saved to working directory.")
+    
+  }, error = function(e) {
+    message("Error in main analysis: ", e$message)
+    stop(e)
+  })
+}
+
+# ================================================================================
+# END OF SCRIPT
+# ================================================================================
+
+# Uncomment the line below to run the complete analysis
+# main()
